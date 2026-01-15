@@ -73,6 +73,45 @@ def block_diff_mask(b, h, q_idx, kv_idx, block_size=None, n=None):
   # **4. Combine Masks **
   return block_diagonal | offset_block_causal | block_causal
 
+
+# FIXME: here I alter to allow variavle size blocks:
+def block_diff_mask_var(b, h, q_idx, kv_idx, token_block_id, n):
+  """
+  Variable-block version of block diffusion attention mask.
+  token_block_id: LongTensor [L] mapping token position -> block index
+  n: seqlen (length of xt). Total sequence = 2n (xt + x0) in training cross-attn.
+  """
+
+  # Flags for xt / x0
+  x0_flag_q = (q_idx >= n)
+  x0_flag_kv = (kv_idx >= n)
+
+  # Map q/kv positions (within xt or x0) to block ids using token_block_id
+  # q_pos, kv_pos in [0, n-1]
+  q_pos = torch.where(x0_flag_q, q_idx - n, q_idx).long()
+  kv_pos = torch.where(x0_flag_kv, kv_idx - n, kv_idx).long()
+
+  # token_block_id lookup (broadcast-friendly)
+  # token_block_id is [n] for base sequence length n
+  block_q = token_block_id[q_pos]
+  block_kv = token_block_id[kv_pos]
+
+  # 1) Block Diagonal within same side (xt<->xt or x0<->x0), same block
+  block_diagonal = (block_q == block_kv) & (x0_flag_q == x0_flag_kv)
+
+  # 2) Offset Block-Causal: xt queries can attend to x0 keys in previous blocks
+  offset_block_causal = (
+    (block_q > block_kv)
+    & (x0_flag_kv == 1)
+    & (x0_flag_q == 0)
+  )
+
+  # 3) Block-Causal within x0: x0 queries attend to x0 keys in same or previous blocks
+  block_causal = (block_q >= block_kv) & (x0_flag_kv == 1) & (x0_flag_q == 1)
+
+  return block_diagonal | offset_block_causal | block_causal
+
+
 @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
 def fused_flex_attention(q, k, v, mask=None):
     return flex_attention(q, k, v, block_mask=mask)
@@ -703,18 +742,70 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     else:
       return bias_dropout_add_scale_fused_inference
     
+  # FIXME: here I alter to allow variavle size blocks:
+  def set_token_block_id(self, token_block_id: torch.Tensor, block_plan=None):
+    """
+    Called from Diffusion when variable blocks are enabled.
+    token_block_id: LongTensor [n] mapping token pos -> block id
+    block_plan: optional, stored for debugging/analysis
+    """
+    # store mapping (non-persistent to avoid ckpt bloat)
+    self.register_buffer("token_block_id", token_block_id, persistent=False)
+    self.block_plan = block_plan
+
+    # regenerate the mask using token_block_id if cross_attn is on
+    if self.config.algo.cross_attn:
+        seqlen = int(token_block_id.numel())
+        self.gen_mask(seqlen, self.block_size, self.attn_backend)
+
+  # FIXME: here I alter to allow variavle size blocks:
+  def gen_mask_varblocks(self, seqlen, attn_backend='sdpa'):
+    """
+    Generates block diffusion mask using token_block_id (variable block sizes).
+    """
+    assert hasattr(self, "token_block_id"), "token_block_id not set; call set_token_block_id() first"
+    assert self.token_block_id.numel() == seqlen, (self.token_block_id.shape, seqlen)
+
+    if attn_backend == 'flex' and FLEX_ATTN_AVAILABLE:
+      # flex uses a callable mask; capture token_block_id in closure
+      tok2blk = self.token_block_id
+      self.block_diff_mask = create_block_mask(
+        partial(block_diff_mask_var, token_block_id=tok2blk, n=seqlen),
+        B=None, H=None, Q_LEN=seqlen * 2, KV_LEN=seqlen * 2
+      )
+
+    elif attn_backend == 'sdpa':
+      # sdpa expects a dense boolean mask (or float mask), you currently use bool
+      tok2blk = self.token_block_id
+      self.block_diff_mask = block_diff_mask_var(
+        b=None, h=None,
+        q_idx=torch.arange(seqlen * 2, device=tok2blk.device)[:, None],
+        kv_idx=torch.arange(seqlen * 2, device=tok2blk.device)[None, :],
+        token_block_id=tok2blk,
+        n=seqlen
+      )
+    else:
+      raise ValueError('Unknown attention backend')
+
+  # FIXME: here I alter to allow variavle size blocks:
   def gen_mask(self, seqlen, block_size, attn_backend='sdpa'):
-    """Genererates attention mask"""
+    """Generates attention mask (fixed blocks or variable blocks if token_block_id is set)."""
+    # if variable blocks are enabled and we have mapping, prefer var-block mask
+    if hasattr(self, "token_block_id"):
+      return self.gen_mask_varblocks(seqlen, attn_backend=attn_backend)
+
+    # ---- original fixed-block implementation (unchanged) ----
     if attn_backend == 'flex' and FLEX_ATTN_AVAILABLE:
       self.block_diff_mask = create_block_mask(
         partial(block_diff_mask, block_size=block_size, n=seqlen),
         B=None, H=None, Q_LEN=seqlen*2, KV_LEN=seqlen*2)
     elif attn_backend == 'sdpa':
       self.block_diff_mask = block_diff_mask(
-        b=None, h=None, q_idx=torch.arange(seqlen*2)[:, None], 
+        b=None, h=None, q_idx=torch.arange(seqlen*2)[:, None],
         kv_idx=torch.arange(seqlen*2)[None, :], block_size=block_size, n=seqlen)
     else:
       raise ValueError('Unknown attention backend')
+
     
   def reset_kv_cache(self):
     for block in self.blocks:

@@ -11,6 +11,15 @@ defaults:
 mode: train  # train / ppl_eval / sample_eval
 diffusion: absorbing_state
 
+block:
+  enabled: false          
+  max_size: 32
+  min_size: 4
+  num_blocks: ${div:${model.length}, 16} 
+  scheme: fixed_cycle     # fixed_cycle / sampled / uniform
+  pattern: [4, 8, 16, 32] 
+  pad_id: null           
+
 seed: 1
 
 block_size: ${model.length}

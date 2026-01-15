@@ -1,5 +1,6 @@
 import itertools
 from dataclasses import dataclass
+from block_utils import make_block_plan, tokens_to_blocks, blocks_to_tokens
 
 import hydra.utils
 import lightning as L
@@ -15,8 +16,6 @@ import metrics
 import models
 import noise_schedule
 import utils
-import numpy as np
-import itertools
 
 def _sample_categorical(categorical_probs):
   gumbel_norm = (1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log())
@@ -66,6 +65,36 @@ class Diffusion(L.LightningModule):
       self.block_size = self.config.model.length
     if self.parameterization == 'ar':
       self.block_size = 1
+
+    # FIXME: here I alter to allow variavle size blocks:
+    self.pad_id = self.tokenizer.pad_token_id
+    self.var_block_enabled = hasattr(self.config, "block") and self.config.block.enabled
+
+    if self.var_block_enabled:
+        self.Bmax = int(self.config.block.max_size)
+        self.num_blocks = int(self.config.block.num_blocks)
+
+        self.block_plan = make_block_plan(
+            L=int(self.config.model.length),
+            N=self.num_blocks,
+            pattern=list(self.config.block.pattern),
+            min_len=int(self.config.block.min_size),
+            max_len=self.Bmax,
+        )
+
+        L = int(self.block_plan.lens.sum().item())
+        token_block_id = torch.empty((L,), dtype=torch.long)
+        for i in range(int(self.block_plan.lens.numel())):
+            s = int(self.block_plan.starts[i].item())
+            l = int(self.block_plan.lens[i].item())
+            token_block_id[s:s+l] = i
+        self.register_buffer("token_block_id", token_block_id) 
+    else:
+        self.Bmax = None
+        self.num_blocks = None
+        self.block_plan = None
+
+
     if self.config.algo.backbone == 'dit':
       self.backbone = models.dit.DIT(
         self.config, vocab_size=self.vocab_size)
@@ -113,6 +142,10 @@ class Diffusion(L.LightningModule):
     self.fast_forward_epochs = None
     self.fast_forward_batches = None
     self._validate_configuration()
+
+    if self.var_block_enabled:
+      self.backbone.set_token_block_id(self.token_block_id, self.block_plan)
+
 
   def _get_parameters(self):
     parameters = [self.backbone.parameters(),
@@ -434,9 +467,16 @@ class Diffusion(L.LightningModule):
         if len(self.metrics.valid_vars[noise_clip_start]) < 100:
           # only report variance over 100 batches
           nlls = losses_clip.nlls
-          self.metrics.valid_vars[noise_clip_start].append(
-            nlls.reshape(
-              nlls.shape[0], -1, self.block_size).mean(-1))
+
+          # FIXME: here I alter to allow variavle size blocks:
+          if self.var_block_enabled:
+              self.metrics.valid_vars[noise_clip_start].append(self._token_to_block_mean(nlls))
+          else:
+              self.metrics.valid_vars[noise_clip_start].append(
+                  nlls.reshape(nlls.shape[0], -1, self.block_size).mean(-1)
+              )
+              
+
     elif self.block_size == 1:
       # nll
       losses = self._loss(batch['input_ids'],
@@ -511,6 +551,31 @@ class Diffusion(L.LightningModule):
       sampling_eps_min: float, minimum percentage of masked tokens.
       sampling_eps_max: float, maximum percentage of masked tokens.
     """
+    # FIXME: here I alter to allow variavle size blocks:
+    if self.var_block_enabled:
+        if p.ndim == 2 and p.shape[1] != x.shape[1]:
+          p = self._block_to_tokens(p)
+
+        # p: [B, L] or [B,1]? 
+        move_indices = torch.rand_like(x.float()) <= p
+        xt = torch.where(move_indices, self.mask_index, x)
+
+        # special case: block size 1 + eps=1.0 => all mask
+        if sampling_eps_min == 1.0 and sampling_eps_max == 1.0:
+            return torch.full_like(x, self.mask_index)
+
+        if self.config.training.resample and not (sampling_eps_min == 1e-3 and sampling_eps_max == 1.0):
+            xt = self._resample_q_xt_varblocks(
+                x=x,
+                xt=xt,
+                move_indices=move_indices,
+                p=p,
+                sampling_eps_min=sampling_eps_min,
+                sampling_eps_max=sampling_eps_max,
+            )
+        return xt
+
+
     if block_size is None:
       block_size = self.block_size
   
@@ -554,9 +619,29 @@ class Diffusion(L.LightningModule):
     p_x0_ /= p_x0_.sum(-1, keepdim=True)
     p_x0[:, -self.block_size:] = p_x0_
     return p_x0
+  
+  # FIXME: here I alter to allow variavle size blocks:
+  @torch.no_grad()
+  def _nucleus_sample_span(self, p_x0, span_len: int):
+    p = self.config.sampling.nucleus_p
+    if p == 1.0:
+      return p_x0
+    p_x0_ = p_x0[:, -span_len:].clone()
+    sorted_probs, sorted_indices = p_x0_.sort(dim=-1, descending=True)
+    cum_probs = sorted_probs.cumsum(dim=-1)
+    nucleus_mask = cum_probs <= p
+    nucleus_mask[..., 0] = 1
+    sorted_probs = sorted_probs * nucleus_mask
+    p_x0_.scatter_(-1, sorted_indices, sorted_probs * nucleus_mask)
+    p_x0_ /= p_x0_.sum(-1, keepdim=True)
+    p_x0[:, -span_len:] = p_x0_
+    return p_x0
 
+  # FIXME: here I alter to allow variavle size blocks:
   @torch.no_grad()
   def _ddpm_caching_update(self, x, t, dt, p_x0=None):
+    block_len = x.shape[1]   # <<< NEW
+
     _, move_chance_t = self.noise(t)
     _, move_chance_s = self.noise(t - dt)
     sigma_t = self._sigma_from_p(move_chance_t)
@@ -565,35 +650,29 @@ class Diffusion(L.LightningModule):
     mask_prob = move_chance_s / move_chance_t
 
     if p_x0 is None:
-      if self.config.sampling.kv_cache:
-        p_x0 = self.forward(x[:, -self.block_size:],
-                        sigma_t,
-                        sample_mode=True).to(torch.float64)
-      else:   
-        p_x0 = self.forward(x,
-                          sigma_t,
-                          sample_mode=True).to(torch.float64)
-        p_x0 = p_x0[:, -self.block_size:]
+      # IMPORTANT: for var-block, just run on x (the span) and keep full length
+      p_x0 = self.forward(x, sigma_t, sample_mode=True).to(torch.float64)
       p_x0 = p_x0.exp()
-      p_x0 = self._nucleus_sample(p_x0)
+      # nucleus sampling needs to respect span length too (see next section)
+      p_x0 = self._nucleus_sample_span(p_x0, span_len=block_len)
 
     if self.config.sampling.first_hitting:
       x_block = _sample_categorical(p_x0)
-      # randomly and uniformly select an index in the block (among masked tokens)
-      num_masked = (x[:, -self.block_size:] == self.mask_index).sum(-1)
-      ind = torch.randint(0, num_masked, (x_block.shape[0],))
-      ind = (x[:, -self.block_size:] == self.mask_index).nonzero()[ind, 1]
-      mask = (torch.arange(self.block_size, device=x.device) == ind[:, None]).to(x_block.dtype)
-      x_block = x_block * mask + x[:, -self.block_size:] * (1 - mask)
+      num_masked = (x == self.mask_index).sum(-1)
+      ind = torch.randint(0, num_masked, (x_block.shape[0],), device=x.device)
+      ind = (x == self.mask_index).nonzero()[ind, 1]
+      mask = (torch.arange(block_len, device=x.device) == ind[:, None]).to(x_block.dtype)
+      x_block = x_block * mask + x * (1 - mask)
     else:
       q_xs = p_x0 * (1 - mask_prob)
       q_xs[:, :, self.mask_index] = mask_prob.squeeze(-1)
       x_block = _sample_categorical(q_xs)
-    copy_flag = (x[:, -self.block_size:] != self.mask_index).to(x.dtype)
-    x_block =  copy_flag * x[:, -self.block_size:] + (1 - copy_flag) * x_block
-    x_new = torch.cat((x[:, :-self.block_size], x_block), dim=-1)
 
-    # compute kv cache if all tokens in a block are sampled
+    copy_flag = (x != self.mask_index).to(x.dtype)
+    x_block = copy_flag * x + (1 - copy_flag) * x_block
+
+    x_new = x_block  # <<< CHANGED: we are updating the span only
+
     if self.config.sampling.kv_cache and self.mask_index not in x_block:
       _ = self.forward(x_block, sigma_t, sample_mode=True, store_kv=True)
 
@@ -601,6 +680,53 @@ class Diffusion(L.LightningModule):
       return None, x_new
     else:
       return p_x0, x_new
+
+  # @torch.no_grad()
+  # def _ddpm_caching_update(self, x, t, dt, p_x0=None):
+  #   _, move_chance_t = self.noise(t)
+  #   _, move_chance_s = self.noise(t - dt)
+  #   sigma_t = self._sigma_from_p(move_chance_t)
+  #   move_chance_t = move_chance_t[:, None]
+  #   move_chance_s = move_chance_s[:, None]
+  #   mask_prob = move_chance_s / move_chance_t
+
+  #   if p_x0 is None:
+  #     if self.config.sampling.kv_cache:
+  #       p_x0 = self.forward(x[:, -self.block_size:],
+  #                       sigma_t,
+  #                       sample_mode=True).to(torch.float64)
+  #     else:   
+  #       p_x0 = self.forward(x,
+  #                         sigma_t,
+  #                         sample_mode=True).to(torch.float64)
+  #       p_x0 = p_x0[:, -self.block_size:]
+  #     p_x0 = p_x0.exp()
+  #     p_x0 = self._nucleus_sample(p_x0)
+
+  #   if self.config.sampling.first_hitting:
+  #     x_block = _sample_categorical(p_x0)
+  #     # randomly and uniformly select an index in the block (among masked tokens)
+  #     num_masked = (x[:, -self.block_size:] == self.mask_index).sum(-1)
+  #     ind = torch.randint(0, num_masked, (x_block.shape[0],))
+  #     ind = (x[:, -self.block_size:] == self.mask_index).nonzero()[ind, 1]
+  #     mask = (torch.arange(self.block_size, device=x.device) == ind[:, None]).to(x_block.dtype)
+  #     x_block = x_block * mask + x[:, -self.block_size:] * (1 - mask)
+  #   else:
+  #     q_xs = p_x0 * (1 - mask_prob)
+  #     q_xs[:, :, self.mask_index] = mask_prob.squeeze(-1)
+  #     x_block = _sample_categorical(q_xs)
+  #   copy_flag = (x[:, -self.block_size:] != self.mask_index).to(x.dtype)
+  #   x_block =  copy_flag * x[:, -self.block_size:] + (1 - copy_flag) * x_block
+  #   x_new = torch.cat((x[:, :-self.block_size], x_block), dim=-1)
+
+  #   # compute kv cache if all tokens in a block are sampled
+  #   if self.config.sampling.kv_cache and self.mask_index not in x_block:
+  #     _ = self.forward(x_block, sigma_t, sample_mode=True, store_kv=True)
+
+  #   if not torch.allclose(x_new, x):
+  #     return None, x_new
+  #   else:
+  #     return p_x0, x_new
 
   @torch.no_grad()
   def _ar_sampler(self, bsz, context_len=1024):
@@ -726,11 +852,15 @@ class Diffusion(L.LightningModule):
     if self.config.sampling.nucleus_p == 1.0:
       return model_output.exp()
     model_output = model_output - model_output.logsumexp(-1, keepdim=True)
-    model_output = self._nucleus_sample(model_output.exp())
+    # FIXME: here I alter to allow variavle size blocks:
+    if self.var_block_enabled:
+      model_output = self._nucleus_sample_span(model_output.exp(), span_len=model_output.shape[1])
+    else:
+      model_output = self._nucleus_sample(model_output.exp())
     return model_output
 
   def _staggered_score(self, score, dsigma):
-    score = score.clone()
+    score = score.clone() 
     extra_const = (1 - dsigma.exp()) * score.sum(dim=-1)
     score *= dsigma.exp()[:, None]
     score[..., self.mask_index] += extra_const
@@ -767,6 +897,26 @@ class Diffusion(L.LightningModule):
 
   def _sample_t(
       self, batch_dims, device, sampling_eps_min, sampling_eps_max, block_size=None):
+    # FIXME: here I alter to allow variavle size blocks:
+    if sampling_eps_max >= 1 and sampling_eps_min >= 1:
+        n = batch_dims[-1]
+        return torch.ones((batch_dims[0], n), device=device)
+
+    if self.var_block_enabled:
+        B = batch_dims[0]
+        N = int(self.block_plan.lens.numel())
+        _eps_b = torch.rand((B, N), device=device)
+
+        if self.antithetic_sampling:
+            offset_b = torch.arange(B * N, device=device) / (B * N)
+            offset_b = offset_b.view(B, N)
+            _eps_b = (_eps_b / (B * N) + offset_b) % 1
+
+        t_b = _eps_b * (sampling_eps_max - sampling_eps_min) + sampling_eps_min  # [B,N]
+        t = self._block_to_tokens(t_b)  # [B,L]
+        return t
+
+    
     if block_size is None:
       block_size = self.block_size
     n = batch_dims[-1]
@@ -824,7 +974,14 @@ class Diffusion(L.LightningModule):
                          sampling_eps_max)
 
     loss_scale, p = self.noise(t)
-    sigma = self._sigma_from_p(p[:,0].unsqueeze(-1))
+
+    # FIXME: here I alter to allow variavle size blocks:
+    if self.var_block_enabled:
+      sigma = self._sigma_from_p(p)
+    else:
+      sigma = self._sigma_from_p(p[:,0].unsqueeze(-1))
+    
+
     dsigma = - loss_scale * torch.expm1(sigma) # used for sedd
 
     # below is needed to reproduce mdlm/sedd numbers with models from sahoo et al
@@ -838,6 +995,16 @@ class Diffusion(L.LightningModule):
                    p,
                    sampling_eps_min=sampling_eps_min,
                    sampling_eps_max=sampling_eps_max)
+    
+    # FIXME: here I alter to allow variavle size blocks:
+    denoise_tok = None
+    if self.var_block_enabled and self.training:
+        B = x0.shape[0]
+        i_b = self._sample_denoise_block(B, x0.device)           # [B]
+        denoise_tok = self._block_index_to_token_mask(i_b)       # [B,L]
+        xt = self._apply_freeze_except(xt, x0, denoise_tok)
+
+
     if sampling_eps_min is not None and sampling_eps_min > 0.5:
       loss_scale = - torch.ones_like(loss_scale)
     if self.ignore_bos:
@@ -852,14 +1019,14 @@ class Diffusion(L.LightningModule):
 
     if self.parameterization == 'sedd':
       return dsigma * self._score_entropy(
-        model_output, sigma, xt, x0)
+        model_output, sigma, xt, x0), denoise_tok
 
     log_p_theta = torch.gather(
       input=model_output,
       dim=-1,
       index=x0[:, :, None]).squeeze(-1)
     loss = loss_scale * log_p_theta
-    return loss
+    return loss, denoise_tok
 
   def _loss(self, x0, attention_mask, t=None, sampling_eps_min=None, sampling_eps_max=None):
     if sampling_eps_min is None and hasattr(self, 'sampling_eps_min'):
@@ -871,19 +1038,40 @@ class Diffusion(L.LightningModule):
     (input_tokens, output_tokens,
      attention_mask) = self._maybe_sub_sample(
        x0, attention_mask)
+    
+    # FIXME: here I alter to allow variavle size blocks:
+    if self.var_block_enabled:
+      xb, maskb, S = self._to_blocks(input_tokens)
+      block_token_mask = self._mask_blocks_to_token_mask(maskb).to(attention_mask.dtype)
+      attention_mask = attention_mask * block_token_mask
+
+
     if self.parameterization == 'ar':
       output = self.forward(input_tokens, None)
       loss = - output.gather(
         -1, output_tokens[:, :, None])[:, :, 0]
     else:
-      loss = self._forward_pass_diffusion(
+      loss_out = self._forward_pass_diffusion(
         input_tokens,
         sampling_eps_min=sampling_eps_min,
         sampling_eps_max=sampling_eps_max,)
+      
+      # FIXME: here I alter to allow variavle size blocks:
+      if isinstance(loss_out, tuple):
+        loss, denoise_tok = loss_out
+      else:
+        loss, denoise_tok = loss_out, None
     
+
     if self.ignore_bos and not self.training:
       attention_mask[:, 0] = 0
       
+
+    # FIXME: here I alter to allow variavle size blocks:
+    if self.var_block_enabled and self.training and denoise_tok is not None:
+      attention_mask = attention_mask * denoise_tok.to(attention_mask.dtype)
+
+
     nlls = (loss * attention_mask)
     token_nll = nlls.sum() / attention_mask.sum()
     return Loss(loss=token_nll,
@@ -988,44 +1176,64 @@ class Diffusion(L.LightningModule):
       num_strides = self.config.model.length // 512
       num_strides -= 1
 
+    # FIXME: here I alter to allow variavle size blocks:
+    if self.var_block_enabled:
+      num_strides = int(self.block_plan.lens.numel())
+      x_accum = self._sample_prior(n_samples, int(self.block_plan.lens.sum().item())).to(self.device)
+      x_accum[:, 0] = self.tokenizer.bos_token_id
+
+
     ones = torch.ones((n_samples,1), dtype=self.dtype,
                       device=self.device)
     
     # reset kvs
     if self.config.sampling.kv_cache:
-      self.backbone.reset_kv_cache(eval_batch_size=self.config.loader.eval_batch_size)
+      self.backbone.reset_kv_cache()
 
     for stride_num in tqdm(range(num_strides)):
       # sample next block
-      if stride_num == 0:
-        x_accum = self._sample_prior(n_samples, self.block_size).to(self.device)
-        x_accum[:, 0] = self.tokenizer.bos_token_id
-      else:
-        if mdlm_semi_ar:
-          x = self._sample_prior(n_samples, 512).to(self.device)
+      if not self.var_block_enabled:
+        if stride_num == 0:
+          x_accum = self._sample_prior(n_samples, self.block_size).to(self.device)
+          x_accum[:, 0] = self.tokenizer.bos_token_id
         else:
-          x = self._sample_prior(n_samples, self.block_size).to(self.device)
-        x_accum = torch.cat((x_accum, x), dim=1)
+          if mdlm_semi_ar:
+            x = self._sample_prior(n_samples, 512).to(self.device)
+          else:
+            x = self._sample_prior(n_samples, self.block_size).to(self.device)
+          x_accum = torch.cat((x_accum, x), dim=1)
 
       # compute logits in a sliding window (context passed to model can't exceed context_size)
-      end_idx = (stride_num + 1) * self.block_size
-      start_idx = max(end_idx - context_size, 0)
-      fwd_idx = torch.arange(start_idx, end_idx)
-      if mdlm_semi_ar and stride_num > 0: # MDLM
-        fwd_idx = torch.arange(512*(stride_num), (512*(stride_num))+self.block_size)
+      # FIXME: here I alter to allow variavle size blocks:
+      # choose which span to denoise this stride
+      if self.var_block_enabled:
+        s = int(self.block_plan.starts[stride_num].item())
+        l = int(self.block_plan.lens[stride_num].item())
+        fwd_idx = torch.arange(s, s + l, device=self.device)
+      else:
+        # original fixed-block logic
+        end_idx = (stride_num + 1) * self.block_size
+        start_idx = max(end_idx - context_size, 0)
+        fwd_idx = torch.arange(start_idx, end_idx, device=self.device)
+        if mdlm_semi_ar and stride_num > 0:  # MDLM
+          fwd_idx = torch.arange(512 * stride_num, 512 * stride_num + self.block_size, device=self.device)
+
 
       dt = 1 / num_steps
       p_x0_cache = None
       timesteps = torch.linspace(1, 0, num_steps, device=self.device)
       t = 1
       for i in range(num_steps):
-        if self.mask_index not in x_accum:
+        if not (x_accum[:, fwd_idx] == self.mask_index).any():
           break
+
 
         # faster (equivalent) sampler from zheng et al (2025)
         if self.config.sampling.first_hitting:
           u = np.random.rand()
-          num_masked = (x_accum[:, fwd_idx] == self.mask_index).sum(-1).item()
+          num_masked = (x_accum[:, fwd_idx] == self.mask_index).sum().item()
+          if num_masked == 0:
+            break
           t *= u**(1 / num_masked)
               
         elif not self.config.sampling.first_hitting:
@@ -1096,3 +1304,147 @@ class Diffusion(L.LightningModule):
         x = x.unsqueeze(0)
 
     return stop, x
+
+  # FIXME: here I alter to allow variavle size blocks:
+  def _to_blocks(self, x: torch.LongTensor):
+    """
+    x: [B, L]
+    returns:
+      xb: [B, Nb, S]   where S = (Bmax if var) else block_size
+      maskb: [B, Nb, S] float/bool mask (1 for valid)
+      S: int
+    """
+    B, L = x.shape
+    if self.var_block_enabled:
+        xb, _, maskb = tokens_to_blocks(
+            tokens=x,
+            plan=self.block_plan,
+            Bmax=self.Bmax,
+            pad_id=self.pad_id,
+        )
+        # xb: [B, N, Bmax]
+        return xb, maskb, self.Bmax
+    else:
+        S = int(self.block_size)
+        assert L % S == 0
+        Nb = L // S
+        xb = x.view(B, Nb, S)
+        maskb = torch.ones_like(xb, dtype=torch.bool)
+        return xb, maskb, S
+
+  def _mask_blocks_to_token_mask(self, maskb: torch.BoolTensor):
+    # maskb: [B, N, Bmax]
+    B, N, Bmax = maskb.shape
+    L = int(self.block_plan.lens.sum().item())
+    token_mask = torch.zeros((B, L), dtype=maskb.dtype, device=maskb.device)
+    for i in range(N):
+        s = int(self.block_plan.starts[i].item())
+        l = int(self.block_plan.lens[i].item())
+        token_mask[:, s:s+l] = maskb[:, i, :l]
+    return token_mask
+
+  def _block_to_tokens(self, x_b: torch.Tensor) -> torch.Tensor:
+      """
+      x_b: [B, N]  (per-block values)
+      returns: [B, L] expanded by plan.lens
+      """
+      assert self.var_block_enabled and self.block_plan is not None
+      B, N = x_b.shape
+      L = int(self.block_plan.lens.sum().item())
+      out = torch.zeros((B, L), device=x_b.device, dtype=x_b.dtype)
+      for i in range(N):
+          s = int(self.block_plan.starts[i].item())
+          l = int(self.block_plan.lens[i].item())
+          out[:, s:s+l] = x_b[:, i:i+1].expand(B, l)
+      return out
+
+  def _masked_ratio_per_block(self, xt_blocks: torch.LongTensor, maskb: torch.BoolTensor) -> torch.Tensor:
+      """
+      xt_blocks: [B, N, Bmax]
+      maskb:     [B, N, Bmax]  True for valid positions
+      returns:   [B, N] masked_ratio in [0,1]
+      """
+      masked = (xt_blocks == self.mask_index) & maskb
+      num_masked = masked.sum(dim=-1).float()              # [B,N]
+      denom = maskb.sum(dim=-1).float().clamp_min(1.0)     # [B,N]
+      return num_masked / denom
+
+  def _resample_q_xt_varblocks(self, x, xt, move_indices, p, sampling_eps_min, sampling_eps_max):
+      """
+      x, xt: [B, L]
+      move_indices: [B, L] bool
+      p: [B, L] (or broadcastable to it)
+      """
+      xb, maskb, _ = self._to_blocks(x)     # xb: [B,N,Bmax]
+      xtb, _, _ = self._to_blocks(xt)       # xtb: [B,N,Bmax]
+
+      perc_masked = self._masked_ratio_per_block(xtb, maskb)  # [B,N]
+
+      # loop until all blocks in range (same spirit as your old code)
+      while (perc_masked < sampling_eps_min).any() or (perc_masked > sampling_eps_max).any():
+          if sampling_eps_min == 1e-3 and sampling_eps_max != 1:
+              regen_b = (perc_masked > sampling_eps_max)
+              if regen_b.max() == 0:
+                  break
+          elif sampling_eps_min != 1e-3 and sampling_eps_max == 1:
+              regen_b = (perc_masked < sampling_eps_min)
+              if regen_b.max() == 0:
+                  break
+          else:
+              regen_b = (perc_masked < sampling_eps_min) | (perc_masked > sampling_eps_max)
+
+          regen_tok = self._block_to_tokens(regen_b.to(x.dtype)).bool()  # [B,L]
+          
+          new_moves = (torch.rand_like(x.float()) < p)
+          move_indices[regen_tok] = new_moves[regen_tok]
+
+          xt = torch.where(move_indices, self.mask_index, x)
+
+          xtb, _, _ = self._to_blocks(xt)
+          perc_masked = self._masked_ratio_per_block(xtb, maskb)
+
+      return xt
+
+  def _token_to_block_mean(self, x_tok: torch.Tensor) -> torch.Tensor:
+    """
+    x_tok: [B, L]
+    returns: [B, N] mean over each block lens
+    """
+    B, L = x_tok.shape
+    N = int(self.block_plan.lens.numel())
+    out = torch.zeros((B, N), device=x_tok.device, dtype=x_tok.dtype)
+    for i in range(N):
+        s = int(self.block_plan.starts[i].item())
+        l = int(self.block_plan.lens[i].item())
+        out[:, i] = x_tok[:, s:s+l].mean(dim=-1)
+    return out
+  
+  def _sample_denoise_block(self, B: int, device) -> torch.LongTensor:
+    """
+    Returns i_b: [B] each in [0, N-1], the block we denoise this step.
+    Simple uniform. You can change to curriculum later.
+    """
+    N = int(self.block_plan.lens.numel())
+    return torch.randint(low=0, high=N, size=(B,), device=device)
+
+  def _block_index_to_token_mask(self, i_b: torch.LongTensor) -> torch.BoolTensor:
+    """
+    i_b: [B] block indices
+    returns denoise_tok: [B,L] True for tokens in the selected block
+    """
+    B = i_b.shape[0]
+    L = int(self.block_plan.lens.sum().item())
+    N = int(self.block_plan.lens.numel())
+    # build per-block boolean then expand to tokens
+    sel_b = torch.zeros((B, N), device=i_b.device, dtype=torch.bool)
+    sel_b.scatter_(1, i_b[:, None], True)
+    denoise_tok = self._block_to_tokens(sel_b.to(torch.float32)).bool()
+    return denoise_tok  # [B,L]
+
+  def _apply_freeze_except(self, xt: torch.LongTensor, x0: torch.LongTensor, denoise_tok: torch.BoolTensor):
+    """
+    Force tokens outside denoise_tok to be clean (equal x0).
+    """
+    xt = xt.clone()
+    xt[~denoise_tok] = x0[~denoise_tok]
+    return xt

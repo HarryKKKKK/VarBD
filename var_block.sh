@@ -5,7 +5,7 @@
 #SBATCH -N 1
 #SBATCH --mem=32G
 #SBATCH -t 72:00:00
-#SBATCH --partition=a40
+#SBATCH --partition=a30
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 
@@ -19,9 +19,7 @@ export TRANSFORMERS_CACHE=$HF_HOME/transformers
 # ===== Variable-length block params =====
 BLOCK_MAX=32
 NUM_BLOCKS=64
-PATTERN= 4,8,16,32  
-
-BASE_BLOCK=16 # Not needed
+PATTERN='[4,8,16,32]'
 
 PRETRAIN_CKPT=null
 
@@ -38,13 +36,12 @@ python -u main.py \
     data.insert_valid_special=False \
     data.insert_valid_eos=False \
     model.length=1024 \
-    block_size=${BASE_BLOCK} \
     block.enabled=true \
     block.max_size=${BLOCK_MAX} \
     block.num_blocks=${NUM_BLOCKS} \
     block.min_size=4 \
     block.scheme=fixed_cycle \
-    block.pattern=[${PATTERN}] \
+    block.pattern=${PATTERN} \
     wandb.name=bd3lm-owt-varblock_max${BLOCK_MAX}_N${NUM_BLOCKS} \
     mode=train \
     model.attn_backend=flex \

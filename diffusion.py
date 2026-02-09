@@ -186,8 +186,11 @@ class Diffusion(L.LightningModule):
     self.metrics.to(*args, **kwargs)
     if hasattr(self.backbone, "block_diff_mask") and self.config.model.attn_backend == 'sdpa':
       self.backbone.block_diff_mask = self.backbone.block_diff_mask.to(*args, **kwargs)
+ 
     elif hasattr(self.backbone, "block_diff_mask") and self.config.model.attn_backend == 'flex':
-      self.backbone.block_diff_mask = self.backbone.block_diff_mask.to(self.device)
+      # self.backbone.block_diff_mask = self.backbone.block_diff_mask.to(self.device)
+      pass
+
     if hasattr(self, 'sampling_eps_min') and torch.is_tensor(self.sampling_eps_min):
       self.sampling_eps_min = self.sampling_eps_min.to(*args, **kwargs)
       self.sampling_eps_max = self.sampling_eps_max.to(*args, **kwargs)
@@ -299,6 +302,10 @@ class Diffusion(L.LightningModule):
           shuffle=False,
           persistent_workers=True))
     self.trainer.fit_loop._combined_loader.flattened = updated_dls
+
+    # FIXME
+    if self.var_block_enabled:
+        self.backbone.gen_mask(self.config.model.length, self.block_size, self.config.model.attn_backend)
 
   def optimizer_step(self, *args, **kwargs):
     super().optimizer_step(*args, **kwargs)

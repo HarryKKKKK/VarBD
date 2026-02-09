@@ -750,13 +750,9 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     block_plan: optional, stored for debugging/analysis
     """
     # store mapping (non-persistent to avoid ckpt bloat)
+    # Note: should also keep in CPU in case for mask stored in CPU
     self.register_buffer("token_block_id", token_block_id, persistent=False)
     self.block_plan = block_plan
-
-    # regenerate the mask using token_block_id if cross_attn is on
-    if self.config.algo.cross_attn:
-        seqlen = int(token_block_id.numel())
-        self.gen_mask(seqlen, self.block_size, self.attn_backend)
 
   # FIXME: here I alter to allow variavle size blocks:
   def gen_mask_varblocks(self, seqlen, attn_backend='sdpa'):
@@ -771,7 +767,7 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       tok2blk = self.token_block_id
       self.block_diff_mask = create_block_mask(
         partial(block_diff_mask_var, token_block_id=tok2blk, n=seqlen),
-        B=None, H=None, Q_LEN=seqlen * 2, KV_LEN=seqlen * 2
+        B=None, H=None, Q_LEN=seqlen * 2, KV_LEN=seqlen * 2, device=tok2blk.device
       )
 
     elif attn_backend == 'sdpa':

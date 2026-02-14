@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J train_owt_bd3lm_varblock
+#SBATCH -J train_owt_bd3lm_fixedblock
 #SBATCH -o watch_folder/%x_%j.out
 #SBATCH -e watch_folder/%x_%j.err
 #SBATCH -N 1
@@ -16,10 +16,10 @@ export HF_HOME=/vol/bitbucket/hk1122/.cache/huggingface
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 export TRANSFORMERS_CACHE=$HF_HOME/transformers
 
-# ===== Variable-length block params =====
-BLOCK_MAX=32
+# ===== Fixed block baseline params =====
+BLOCK_SIZE=32
 NUM_BLOCKS=64
-PATTERN='[4,8,16,32]'
+PATTERN="[${BLOCK_SIZE}]"
 
 PRETRAIN_CKPT=null
 
@@ -37,12 +37,12 @@ python -u main.py \
     data.insert_valid_eos=False \
     model.length=1024 \
     block.enabled=true \
-    block.max_size=${BLOCK_MAX} \
+    block.max_size=${BLOCK_SIZE} \
+    block.min_size=${BLOCK_SIZE} \
     block.num_blocks=${NUM_BLOCKS} \
-    block.min_size=4 \
-    block.scheme=fixed_cycle \
+    block.scheme=fixed \
     block.pattern=${PATTERN} \
-    wandb.name=bd3lm-owt-varblock_max${BLOCK_MAX}_N${NUM_BLOCKS} \
+    wandb.name=bd3lm-owt-fixedblock_${BLOCK_SIZE} \
     mode=train \
     model.attn_backend=flex \
     training.resample=True \

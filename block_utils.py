@@ -7,177 +7,100 @@ import torch
 
 @dataclass(frozen=True)
 class BlockPlan:
-    lens: torch.LongTensor   # [N]
-    starts: torch.LongTensor # [N]
+    lens: torch.LongTensor
+    starts: torch.LongTensor
 
-
-def _distribute_diff_inplace(
-    lens: List[int],
-    target_sum: int,
-    min_len: int,
-    max_len: int,
-    prefer_tail: bool = True,
-) -> None:
-    """
-    Adjust `lens` in-place so sum(lens) == target_sum, while respecting [min_len, max_len].
-    Uses a simple round-robin over indices (tail-first by default).
-    """
-    cur = sum(lens)
-    diff = target_sum - cur
-    if diff == 0:
-        return
-
-    idxs = list(range(len(lens)))
-    if prefer_tail:
-        idxs = idxs[::-1]
-
-    # One "step" changes sum by +/-1, so we can always converge if feasible.
-    step = 1 if diff > 0 else -1
-    remaining = abs(diff)
-
-    # Quick feasibility check
-    if step > 0:
-        cap = sum(max_len - x for x in lens)
-        if remaining > cap:
-            raise ValueError(
-                f"Cannot increase sum to {target_sum}: need +{remaining}, capacity={cap}"
-            )
-    else:
-        cap = sum(x - min_len for x in lens)
-        if remaining > cap:
-            raise ValueError(
-                f"Cannot decrease sum to {target_sum}: need -{remaining}, capacity={cap}"
-            )
-
-    # Round-robin adjust
-    p = 0
-    while remaining > 0:
-        i = idxs[p]
-        nxt = lens[i] + step
-        if min_len <= nxt <= max_len:
-            lens[i] = nxt
-            remaining -= 1
-        p = (p + 1) % len(idxs)
-
-
-def make_block_plan_pattern(
+def make_fixed_plan(
     L: int,
-    N: int,
-    pattern: List[int],
-    min_len: int,
-    max_len: int,
+    block_size: int,
+    *,
     device: Optional[torch.device] = None,
 ) -> BlockPlan:
     """
-    Make a plan of N blocks whose lengths repeat `pattern` (clamped to [min_len, max_len]),
-    then adjust lengths to ensure total sum is exactly L.
+    Split a length-L sequence into blocks of fixed size `block_size`.
+    The last block is allowed to be shorter (must end the block at sentence end).
     """
-    if N <= 0:
-        raise ValueError("N must be > 0")
-    if len(pattern) == 0:
-        raise ValueError("pattern must be non-empty")
-    if min_len > max_len:
-        raise ValueError("min_len must be <= max_len")
-    if L < N * min_len or L > N * max_len:
-        raise ValueError(f"Infeasible L={L} for N={N} with [{min_len},{max_len}]")
+    if L <= 0:
+        raise ValueError("L must be > 0")
+    if block_size <= 0:
+        raise ValueError("block_size must be > 0")
 
-    lens: List[int] = []
-    for i in range(N):
-        l = pattern[i % len(pattern)]
-        l = max(min_len, min(max_len, int(l)))
-        lens.append(l)
-
-    _distribute_diff_inplace(lens, target_sum=L, min_len=min_len, max_len=max_len, prefer_tail=True)
+    n = (L + block_size - 1) // block_size 
+    lens = [block_size] * n
+    lens[-1] = L - block_size * (n - 1)
 
     lens_t = torch.tensor(lens, dtype=torch.long, device=device)
-    starts_t = torch.zeros(N, dtype=torch.long, device=device)
+    starts_t = torch.zeros(n, dtype=torch.long, device=device)
     starts_t[1:] = torch.cumsum(lens_t[:-1], dim=0)
     return BlockPlan(lens=lens_t, starts=starts_t)
 
 
-def make_block_plan_stages(
-    L: int,
-    blocks_per_stage: int,
-    sizes: List[int],
-    min_len: int,
-    max_len: int,
+def make_multilevel_block_plan_for_repeated_sequence(
+    L_single: int,
+    block_sizes: List[int],
+    *,
     device: Optional[torch.device] = None,
-    adjust_only_last_stage: bool = True,
-) -> BlockPlan:
+) -> Tuple[BlockPlan, torch.LongTensor]:
     """
-    Your requested schedule:
-      sizes = [4,8,16,32,64], blocks_per_stage = N  => total blocks = len(sizes)*N
-      first N blocks are 4, next N are 8, ..., last N are 64.
-
-    If sum(sizes)*N != L, we adjust to match L while respecting [min_len, max_len].
-    By default we only adjust blocks in the LAST stage (so earlier stages stay exact).
+    Returns:
+      global_plan: BlockPlan over total length Ltot = K * L_single
+      levels: LongTensor [Ntotal], level id per block (0..K-1)
     """
-    if blocks_per_stage <= 0:
-        raise ValueError("blocks_per_stage must be > 0")
-    if len(sizes) == 0:
-        raise ValueError("sizes must be non-empty")
-    if min_len > max_len:
-        raise ValueError("min_len must be <= max_len")
+    if L_single <= 0:
+        raise ValueError("L_single must be > 0")
+    if len(block_sizes) == 0:
+        raise ValueError("block_sizes must be non-empty")
 
-    # build scheduled lens
-    lens: List[int] = []
-    for s in sizes:
-        s = max(min_len, min(max_len, int(s)))
-        lens.extend([s] * blocks_per_stage)
+    all_lens = []
+    all_starts = []
+    all_levels = []
 
-    Ntotal = len(lens)
-    if L < Ntotal * min_len or L > Ntotal * max_len:
-        raise ValueError(f"Infeasible L={L} for Ntotal={Ntotal} with [{min_len},{max_len}]")
+    K = len(block_sizes)
+    for k, b in enumerate(block_sizes):
+        plan_k = make_fixed_plan(L_single, int(b), device=device)
+        offset = k * L_single
+        all_lens.append(plan_k.lens)
+        all_starts.append(plan_k.starts + offset)
+        all_levels.append(torch.full((plan_k.lens.numel(),), k, dtype=torch.long, device=device))
 
-    if sum(lens) != L:
-        if adjust_only_last_stage:
-            # adjust only the last `blocks_per_stage` blocks
-            head = lens[:-blocks_per_stage]
-            tail = lens[-blocks_per_stage:]
-            target_tail_sum = L - sum(head)
-            if target_tail_sum < blocks_per_stage * min_len or target_tail_sum > blocks_per_stage * max_len:
-                # fallback: adjust across all blocks
-                _distribute_diff_inplace(lens, target_sum=L, min_len=min_len, max_len=max_len, prefer_tail=True)
-            else:
-                _distribute_diff_inplace(tail, target_sum=target_tail_sum, min_len=min_len, max_len=max_len, prefer_tail=True)
-                lens = head + tail
-        else:
-            _distribute_diff_inplace(lens, target_sum=L, min_len=min_len, max_len=max_len, prefer_tail=True)
+    lens = torch.cat(all_lens, dim=0)
+    starts = torch.cat(all_starts, dim=0)
+    levels = torch.cat(all_levels, dim=0)
 
-    lens_t = torch.tensor(lens, dtype=torch.long, device=device)
-    starts_t = torch.zeros(Ntotal, dtype=torch.long, device=device)
-    starts_t[1:] = torch.cumsum(lens_t[:-1], dim=0)
-    return BlockPlan(lens=lens_t, starts=starts_t)
+    return BlockPlan(lens=lens, starts=starts), levels
 
 
+# =========================
+# Block <-> token packing
+# =========================
 def tokens_to_blocks(
-    tokens: torch.LongTensor,   # [B, L]
+    tokens: torch.LongTensor,   # [B, Ltot]
     plan: BlockPlan,
     Bmax: int,
     pad_id: int,
 ) -> Tuple[torch.LongTensor, torch.LongTensor, torch.BoolTensor]:
     """
     returns:
-      blocks:      [B, N, Bmax]
-      block_lens:  [B, N]     (true lengths, must be <= Bmax)
-      block_mask:  [B, N, Bmax]  True for real positions
+      blocks:      [B, Ntotal, Bmax]
+      block_lens:  [B, Ntotal]
+      block_mask:  [B, Ntotal, Bmax]
     """
-    B, L = tokens.shape
-    N = int(plan.lens.numel())
+    B, Ltot = tokens.shape
+    Ntotal = int(plan.lens.numel())
 
-    if int(plan.lens.sum().item()) != L:
-        raise ValueError(f"Plan sum {int(plan.lens.sum().item())} != token length L={L}")
+    if int(plan.lens.sum().item()) != Ltot:
+        raise ValueError(f"Plan sum {int(plan.lens.sum().item())} != token length Ltot={Ltot}")
     if int(plan.lens.max().item()) > Bmax:
-        raise ValueError(f"Plan has block len {int(plan.lens.max().item())} > Bmax={Bmax}. Increase Bmax or clamp lens.")
+        raise ValueError(f"Plan has block len {int(plan.lens.max().item())} > Bmax={Bmax}")
 
-    blocks = tokens.new_full((B, N, Bmax), pad_id)
-    block_mask = torch.zeros((B, N, Bmax), dtype=torch.bool, device=tokens.device)
+    blocks = tokens.new_full((B, Ntotal, Bmax), pad_id)
+    block_mask = torch.zeros((B, Ntotal, Bmax), dtype=torch.bool, device=tokens.device)
 
-    for i in range(N):
+    for i in range(Ntotal):
         s = int(plan.starts[i].item())
         l = int(plan.lens[i].item())
-        if s + l > L:
-            raise ValueError(f"Block {i} out of range: start={s}, len={l}, L={L}")
+        if s + l > Ltot:
+            raise ValueError(f"Block {i} out of range: start={s}, len={l}, Ltot={Ltot}")
         blocks[:, i, :l] = tokens[:, s:s + l]
         block_mask[:, i, :l] = True
 
@@ -186,22 +109,22 @@ def tokens_to_blocks(
 
 
 def blocks_to_tokens(
-    blocks: torch.LongTensor,  # [B, N, Bmax]
+    blocks: torch.LongTensor,  # [B, Ntotal, Bmax]
     plan: BlockPlan,
     Bmax: int,
 ) -> torch.LongTensor:
-    B, N, Bmax_ = blocks.shape
+    B, Ntotal, Bmax_ = blocks.shape
     if Bmax_ != Bmax:
         raise ValueError("Bmax mismatch")
-    if int(plan.lens.numel()) != N:
+    if int(plan.lens.numel()) != Ntotal:
         raise ValueError("Plan N mismatch with blocks N")
     if int(plan.lens.max().item()) > Bmax:
         raise ValueError(f"Plan has block len {int(plan.lens.max().item())} > Bmax={Bmax}")
 
-    L = int(plan.lens.sum().item())
-    tokens = blocks.new_empty((B, L))
+    Ltot = int(plan.lens.sum().item())
+    tokens = blocks.new_empty((B, Ltot))
 
-    for i in range(N):
+    for i in range(Ntotal):
         s = int(plan.starts[i].item())
         l = int(plan.lens[i].item())
         tokens[:, s:s + l] = blocks[:, i, :l]
@@ -209,116 +132,138 @@ def blocks_to_tokens(
     return tokens
 
 
-# =========================
-# Main sanity tests
-# =========================
+# Only for testing
+def string_to_char_tokens(text: str) -> Tuple[torch.LongTensor, List[str]]:
+    """
+    Demo tokenizer: character-level.
+    Returns:
+      tokens: [L] int64
+      vocab: list mapping id->char
+    """
+    chars = list(text)
+    # Keep a stable mapping
+    uniq = sorted(set(chars))
+    char_to_id = {c: i for i, c in enumerate(uniq)}
+    ids = torch.tensor([char_to_id[c] for c in chars], dtype=torch.long)
+    return ids, uniq
+
+
+def char_tokens_to_string(tokens_1d: torch.LongTensor, vocab: List[str]) -> str:
+    return "".join(vocab[int(i)] for i in tokens_1d.tolist())
+
+
+def pretty_print_blocks_as_text(
+    tokens_1d: torch.LongTensor,
+    plan: BlockPlan,
+    levels: torch.LongTensor,
+    vocab: List[str],
+    L_single: int,
+    block_sizes: List[int],
+) -> None:
+    """
+    Print each level's blocks as substrings.
+    """
+    K = len(block_sizes)
+    assert tokens_1d.ndim == 1
+    assert int(plan.lens.sum().item()) == tokens_1d.numel()
+
+    print("\n=== Pretty print: per-level blocks ===")
+    for k in range(K):
+        seg_start = k * L_single
+        seg_end = (k + 1) * L_single
+        level_text = char_tokens_to_string(tokens_1d[seg_start:seg_end], vocab)
+        print(f"\n[Level {k}] block_size={block_sizes[k]} | text='{level_text}'")
+
+        block_ids = torch.nonzero(levels == k, as_tuple=False).squeeze(-1).tolist()
+        for bi, gb in enumerate(block_ids):
+            s = int(plan.starts[gb].item())
+            l = int(plan.lens[gb].item())
+            block_text = char_tokens_to_string(tokens_1d[s:s + l], vocab)
+            print(f"  block {bi:02d}: start={s:03d} len={l:02d} | '{block_text}'")
+
+
 if __name__ == "__main__":
-    print("=== Running block utils sanity tests ===")
+    print("=== Running multi-level repeat+block tests ===")
     torch.set_printoptions(linewidth=140)
 
-    # --------------------------
-    # Test 1: pattern plan
-    # --------------------------
-    B = 2
-    L = 20
-    N = 5
-    Bmax = 6
-    pattern = [2, 3, 5, 4, 6]
-    min_len = 1
-    max_len = Bmax
+    text = "xxxxxxxxxxxxxxxxxyyyyyyyyyyyyyyyyyyyyyyyyyyzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+    block_sizes = [4, 8, 16] 
+
+    # 1) char-level tokens
+    single_tokens_1d, vocab = string_to_char_tokens(text)
+    L_single = int(single_tokens_1d.numel())
+    K = len(block_sizes)
+    Ltot = K * L_single
+
+    # 2) repeat K times (exact copies)
+    tokens_1d = single_tokens_1d.repeat(K)  # [Ltot]
+    tokens = tokens_1d.unsqueeze(0)         # [B=1, Ltot]
+
+    # 3) build multi-level plan
+    plan, levels = make_multilevel_block_plan_for_repeated_sequence(
+        L_single=L_single,
+        block_sizes=block_sizes,
+        device=tokens.device,
+    )
+
+    # invariants
+    assert int(plan.lens.sum().item()) == Ltot
+    assert plan.starts.numel() == plan.lens.numel() == levels.numel()
+    assert plan.starts[0].item() == 0
+    assert torch.all(plan.starts[1:] >= plan.starts[:-1])  # non-decreasing global starts
+
+    print(f"\nText length (single) L_single={L_single}, repeats K={K}, total Ltot={Ltot}")
+    print("Global plan: Ntotal blocks =", int(plan.lens.numel()))
+    print("First 20 lens  :", plan.lens[:20].tolist())
+    print("First 20 starts:", plan.starts[:20].tolist())
+    print("First 20 levels:", levels[:20].tolist())
+
+    # 4) pack/unpack (roundtrip)
+    Bmax = int(max(block_sizes))  # safe here: max block size across levels
     pad_id = -1
 
-    plan = make_block_plan_pattern(L=L, N=N, pattern=pattern, min_len=min_len, max_len=max_len)
-    print("\n[Test1] Pattern plan")
-    print("  lens  :", plan.lens.tolist())
-    print("  starts:", plan.starts.tolist())
-
-    assert plan.lens.numel() == N
-    assert int(plan.lens.sum().item()) == L
-    assert plan.starts[0].item() == 0
-    assert torch.all(plan.starts[1:] == torch.cumsum(plan.lens[:-1], dim=0))
-
-    tokens = torch.arange(B * L).view(B, L)
     blocks, block_lens, block_mask = tokens_to_blocks(tokens=tokens, plan=plan, Bmax=Bmax, pad_id=pad_id)
     tokens_rec = blocks_to_tokens(blocks=blocks, plan=plan, Bmax=Bmax)
 
-    assert torch.equal(tokens, tokens_rec)
-    assert torch.equal(block_lens[0], plan.lens)
-    assert block_mask.shape == (B, N, Bmax)
-    print("tokens <-> blocks roundtrip OK")
+    assert torch.equal(tokens, tokens_rec), "Roundtrip tokens->blocks->tokens failed"
 
-    # --------------------------
-    # Test 2: stage schedule
-    # --------------------------
-    sizes = [4, 8, 16, 32, 64]
-    blocks_per_stage = 3
-    Ntotal = len(sizes) * blocks_per_stage
-    Bmax2 = 64
-    min_len2, max_len2 = 1, Bmax2
-    L2 = sum(sizes) * blocks_per_stage  # exact match (no adjustment needed)
+    # 5) check: within each level, blocks end exactly at sentence end (last block may be short)
+    # We verify the blocks in that level cover exactly [k*L_single, (k+1)*L_single)
+    for k, b in enumerate(block_sizes):
+        ids = torch.nonzero(levels == k, as_tuple=False).squeeze(-1)
+        starts_k = plan.starts[ids]
+        lens_k = plan.lens[ids]
+        # coverage check: first block starts at k*L_single
+        assert int(starts_k[0].item()) == k * L_single
+        # last block ends at (k+1)*L_single
+        last_end = int((starts_k[-1] + lens_k[-1]).item())
+        assert last_end == (k + 1) * L_single
 
-    plan2 = make_block_plan_stages(
-        L=L2,
-        blocks_per_stage=blocks_per_stage,
-        sizes=sizes,
-        min_len=min_len2,
-        max_len=max_len2,
-        adjust_only_last_stage=True,
-    )
+        # all blocks except last should have len==b, last <= b
+        if lens_k.numel() > 1:
+            assert torch.all(lens_k[:-1] == b)
+        assert int(lens_k[-1].item()) <= b
 
-    print("\n[Test2] Stage schedule plan")
-    print("  lens  (first 20):", plan2.lens[:20].tolist(), "...")
-    print("  starts(first 10):", plan2.starts[:10].tolist(), "...")
-
-    # invariants
-    assert plan2.lens.numel() == Ntotal
-    assert int(plan2.lens.sum().item()) == L2
-    assert plan2.starts[0].item() == 0
-    assert torch.all(plan2.starts[1:] == torch.cumsum(plan2.lens[:-1], dim=0))
-
-    # check the schedule segments exactly
-    for k, s in enumerate(sizes):
-        seg = plan2.lens[k * blocks_per_stage:(k + 1) * blocks_per_stage]
-        assert torch.all(seg == s), f"Stage {k} expected all {s}, got {seg.tolist()}"
-
-    tokens2 = torch.arange(B * L2).view(B, L2)
-    blocks2, _, mask2 = tokens_to_blocks(tokens=tokens2, plan=plan2, Bmax=Bmax2, pad_id=pad_id)
-    tokens2_rec = blocks_to_tokens(blocks=blocks2, plan=plan2, Bmax=Bmax2)
-    assert torch.equal(tokens2, tokens2_rec)
-
-    # IMPORTANT: mask2.all() is NOT True because many blocks have l < Bmax2 -> padding False.
-    # Instead, validate per-block correctness:
+    # 6) validate mask correctness per block
+    Ntotal = int(plan.lens.numel())
     for i in range(Ntotal):
-        l = int(plan2.lens[i].item())
-        assert torch.all(mask2[:, i, :l] == True)
-        assert torch.all(mask2[:, i, l:] == False)
+        l = int(plan.lens[i].item())
+        assert torch.all(block_mask[:, i, :l] == True)
+        assert torch.all(block_mask[:, i, l:] == False)
+        # padding area should be pad_id
+        if l < Bmax:
+            assert torch.all(blocks[:, i, l:] == pad_id)
 
-    print("scheduled lens segments OK, mask OK, tokens <-> blocks roundtrip OK")
+    print("All invariants passed: plan coverage OK, roundtrip OK, mask OK")
 
-    # --------------------------
-    # Test 3: stage schedule with non-matching L (forces adjustment in last stage)
-    # --------------------------
-    L3 = L2 - 5  # make it slightly smaller
-    plan3 = make_block_plan_stages(
-        L=L3,
-        blocks_per_stage=blocks_per_stage,
-        sizes=sizes,
-        min_len=min_len2,
-        max_len=max_len2,
-        adjust_only_last_stage=True,
+    # 7) pretty print blocks as strings so you can eyeball it
+    pretty_print_blocks_as_text(
+        tokens_1d=tokens_1d,
+        plan=plan,
+        levels=levels,
+        vocab=vocab,
+        L_single=L_single,
+        block_sizes=block_sizes,
     )
-    print("\n[Test3] Stage schedule with adjustment")
-    print("  sum(lens):", int(plan3.lens.sum().item()), "target:", L3)
 
-    # earlier stages should stay exact; last stage may be tweaked
-    for k, s in enumerate(sizes[:-1]):
-        seg = plan3.lens[k * blocks_per_stage:(k + 1) * blocks_per_stage]
-        assert torch.all(seg == s)
-
-    assert int(plan3.lens.sum().item()) == L3
-    assert int(plan3.lens.max().item()) <= Bmax2
-    assert int(plan3.lens.min().item()) >= min_len2
-
-    print("adjusted only tail stage (or safely fell back) and preserved constraints")
-
-    print("\n-------------\nAll block utils tests passed!")
+    print("-------------\nAll tests passed!")

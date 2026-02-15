@@ -14,6 +14,7 @@ diffusion: absorbing_state
 seed: 1
 
 block_size: ${model.length}
+block_sizes: null
 
 loader:
   global_batch_size: 512

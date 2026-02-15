@@ -18,6 +18,8 @@ import utils
 import numpy as np
 import itertools
 
+from block_utils import BlockPlan, token2block_from_plan, make_multilevel_block_plan_for_repeated_sequence
+
 def _sample_categorical(categorical_probs):
   gumbel_norm = (1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log())
   samples = (categorical_probs / gumbel_norm).argmax(dim=-1)
@@ -64,6 +66,38 @@ class Diffusion(L.LightningModule):
       self.block_size = self.config.block_size
     else:
       self.block_size = self.config.model.length
+
+    # FIXME: load block_sizes
+    self.block_sizes = None
+    self.K = None
+    self.L_single = None
+    self.block_plan = None
+    self.block_levels = None
+    self.token2block = None
+
+    if hasattr(config, "block_sizes") and config.block_sizes is not None:
+      bs = list(config.block_sizes)
+      if len(bs) > 0:
+        self.block_sizes = [int(x) for x in bs]
+        self.K = len(bs)
+        
+        # Ltot should be K * text_length
+        Ltot = int(self.config.model.length)
+        if Ltot % self.K != 0:
+          raise ValueError(f"model.length={Ltot} must be divisible by K={self.K} (len(block_sizes))")
+        self.L_single = Ltot // self.K
+
+        self.block_plan, self.block_levels = make_multilevel_block_plan_for_repeated_sequence(
+          L_single=self.L_single,
+          block_sizes=self.block_sizes,
+          device=torch.device("cpu"),
+        )
+        self.token2block = token2block_from_plan(self.block_plan)  # shape [Ltot]
+
+        self.block_size = int(self.block_plan.lens.max().item())
+        print(f"[multilevel] block_sizes={self.block_sizes}, K={self.K}, L_single={self.L_single}, Ltot={Ltot}, Bmax={self.block_size}")
+
+
     if self.parameterization == 'ar':
       self.block_size = 1
     if self.config.algo.backbone == 'dit':
@@ -87,6 +121,27 @@ class Diffusion(L.LightningModule):
         self.backbone.backbone.gen_mask(self.config.model.length, self.block_size, attn_backend='sdpa')
     else:
       raise ValueError(f'Unknown backbone: {self.config.algo.backbone}')
+
+    # FIXME: regenerate attention mask
+    if self.config.algo.name == 'bd3lm' and self.parameterization != 'ar' and self.config.algo.backbone == 'dit':
+      bb = getattr(self.backbone, "backbone", None)
+      target = bb if bb is not None else self.backbone
+
+      if (self.block_plan is not None) and hasattr(target, "gen_mask_from_plan"):
+        target.gen_mask_from_plan(
+          seqlen=self.config.model.length,
+          plan=self.block_plan,
+          attn_backend=self.config.model.attn_backend,
+        )
+      elif hasattr(target, "gen_mask"):
+        target.gen_mask(
+          self.config.model.length,
+          self.block_size,
+          attn_backend=self.config.model.attn_backend,
+        )
+      else:
+        raise AttributeError("Backbone has neither gen_mask_from_plan nor gen_mask")
+
 
     self.T = self.config.algo.T
     self.num_tokens = self.config.model.length
@@ -158,6 +213,16 @@ class Diffusion(L.LightningModule):
     if hasattr(self, 'sampling_eps_min') and torch.is_tensor(self.sampling_eps_min):
       self.sampling_eps_min = self.sampling_eps_min.to(*args, **kwargs)
       self.sampling_eps_max = self.sampling_eps_max.to(*args, **kwargs)
+    
+    # FIXME: also move block plan
+    if self.block_plan is not None:
+      dev = self.device
+      self.block_plan = BlockPlan(
+        lens=self.block_plan.lens.to(dev),
+        starts=self.block_plan.starts.to(dev),
+      )
+      if self.token2block is not None:
+        self.token2block = self.token2block.to(dev)
     return self
 
   def _replace_ckpt_keys(self, checkpoint):
@@ -434,9 +499,38 @@ class Diffusion(L.LightningModule):
         if len(self.metrics.valid_vars[noise_clip_start]) < 100:
           # only report variance over 100 batches
           nlls = losses_clip.nlls
-          self.metrics.valid_vars[noise_clip_start].append(
-            nlls.reshape(
-              nlls.shape[0], -1, self.block_size).mean(-1))
+          # FIXME: reshape corresponding the block
+          if self.block_plan is not None:
+            plan = self.block_plan
+            lens = plan.lens.to(nlls.device)
+            starts = plan.starts.to(nlls.device)
+
+            B, L = nlls.shape
+            N = int(lens.numel())
+
+            per_block = []
+            eps = 1e-8
+            for bi in range(N):
+              s = int(starts[bi].item())
+              l = int(lens[bi].item())
+              e = s + l
+
+              blk_nll = nlls[:, s:e]                         # [B, l]
+              blk_m = losses_clip.token_mask[:, s:e].to(nlls.dtype)
+              denom = blk_m.sum(dim=-1).clamp_min(eps)       # [B]
+              mean_blk = (blk_nll * blk_m).sum(dim=-1) / denom  # [B]
+              per_block.append(mean_blk)
+
+            # [B, Nblocks]
+            per_block = torch.stack(per_block, dim=1)
+            self.metrics.valid_vars[noise_clip_start].append(per_block)
+
+          else:
+            self.metrics.valid_vars[noise_clip_start].append(
+              nlls.reshape(
+                nlls.shape[0], -1, self.block_size).mean(-1))
+            
+
     elif self.block_size == 1:
       # nll
       losses = self._loss(batch['input_ids'],
@@ -499,6 +593,37 @@ class Diffusion(L.LightningModule):
       perc_masked = (xt == self.mask_index).float().sum(-1) / block_size
     return xt
   
+  # FIXME: resample var block
+  def _resample_q_xt_plan(self, x, xt, move_indices, p, sampling_eps_min, sampling_eps_max):
+    plan = self.block_plan
+    assert plan is not None
+    lens = plan.lens.to(x.device)
+    starts = plan.starts.to(x.device)
+
+    B = x.shape[0]
+    max_iters = 50
+    for _ in range(max_iters):
+      any_bad = False
+      for bi in range(int(lens.numel())):
+        s = int(starts[bi].item())
+        l = int(lens[bi].item())
+        e = s + l
+
+        xt_blk = xt[:, s:e]
+        perc = (xt_blk == self.mask_index).float().sum(-1) / float(l)  # [B]
+        regen = (perc < sampling_eps_min) | (perc > sampling_eps_max)
+        if regen.any():
+          any_bad = True
+
+          p_blk = p[regen]              # [B_regen, 1]
+          new_move = (torch.rand((regen.sum().item(), l), device=x.device) <= p_blk)  # [B_regen, l]
+          move_indices[regen, s:e] = new_move
+          xt[regen, s:e] = torch.where(new_move, self.mask_index, x[regen, s:e])
+      if not any_bad:
+        break
+    return xt
+
+
   def q_xt(
       self, x, p, block_size=None, sampling_eps_min=None, sampling_eps_max=None):
     """Computes the noisy sample xt.
@@ -522,17 +647,17 @@ class Diffusion(L.LightningModule):
       return torch.full_like(x, self.mask_index)
 
     # no need to resample for bounds 1e-3, 1
+    if sampling_eps_min is None: sampling_eps_min = 1e-3
+    if sampling_eps_max is None: sampling_eps_max = 1.0
     if self.config.training.resample and \
       not (sampling_eps_min == 1e-3 and sampling_eps_max == 1.0):
-      xt = xt.reshape(xt.shape[0], -1, block_size)
-      xt = self._resample_q_xt(x,
-                               xt,
-                               move_indices,
-                               p,
-                               block_size,
-                               sampling_eps_min,
-                               sampling_eps_max)
-      xt = xt.reshape(xt.shape[0], -1)
+      if self.block_plan is None:
+        xt = xt.reshape(xt.shape[0], -1, block_size)
+        xt = self._resample_q_xt(x, xt, move_indices, p, block_size, sampling_eps_min, sampling_eps_max)
+        xt = xt.reshape(xt.shape[0], -1)
+      # FIXME: var block xt
+      else: 
+        xt = self._resample_q_xt_plan(x, xt, move_indices, p, sampling_eps_min, sampling_eps_max)
     return xt
 
   def _sample_prior(self, *batch_dims):
@@ -767,26 +892,53 @@ class Diffusion(L.LightningModule):
 
   def _sample_t(
       self, batch_dims, device, sampling_eps_min, sampling_eps_max, block_size=None):
-    if block_size is None:
-      block_size = self.block_size
-    n = batch_dims[-1]
-    num_blocks = n // block_size
-    _eps_b = torch.rand((batch_dims[0], num_blocks), device=device)
+    # FIXME: origional code
+    if self.block_plan is None:
+      if block_size is None:
+        block_size = self.block_size
+      n = batch_dims[-1]
+      num_blocks = n // block_size
+      _eps_b = torch.rand((batch_dims[0], num_blocks), device=device)
 
-    # antithetic sampling along blocks & batches (for uniform sampling)
-    if self.antithetic_sampling:
-      offset_b = torch.arange(batch_dims[0] * num_blocks, device=device) / (batch_dims[0] * num_blocks)
-      offset_b = offset_b.view(batch_dims[0], num_blocks)
-      _eps_b = (_eps_b / (batch_dims[0] * num_blocks) + offset_b) % 1
-    t = _eps_b
-    if block_size != self.config.model.length:
-      t = t.repeat_interleave(block_size, dim=-1)
+      # antithetic sampling along blocks & batches (for uniform sampling)
+      if self.antithetic_sampling:
+        offset_b = torch.arange(batch_dims[0] * num_blocks, device=device) / (batch_dims[0] * num_blocks)
+        offset_b = offset_b.view(batch_dims[0], num_blocks)
+        _eps_b = (_eps_b / (batch_dims[0] * num_blocks) + offset_b) % 1
+      t = _eps_b
+      if block_size != self.config.model.length:
+        t = t.repeat_interleave(block_size, dim=-1)
 
-    # nll
-    if sampling_eps_max >= 1 and sampling_eps_min >= 1:
-      return torch.ones_like(t)
-    t = t * (sampling_eps_max - sampling_eps_min) + sampling_eps_min
-    return t
+      # nll
+      if sampling_eps_max >= 1 and sampling_eps_min >= 1:
+        return torch.ones_like(t)
+      t = t * (sampling_eps_max - sampling_eps_min) + sampling_eps_min
+      return t
+    
+    # FIXME: var block
+    else:
+      B = batch_dims[0]
+      n = batch_dims[-1]
+      plan = self.block_plan
+      lens = plan.lens.to(device)
+      if int(lens.sum().item()) != n:
+        raise ValueError(f"Plan sum {int(lens.sum().item())} != n={n}")
+
+      Nblocks = int(lens.numel())
+      eps_b = torch.rand((B, Nblocks), device=device)
+
+      if self.antithetic_sampling:
+        offset = torch.arange(B * Nblocks, device=device) / (B * Nblocks)
+        eps_b = (eps_b / (B * Nblocks) + offset.view(B, Nblocks)) % 1
+
+      if sampling_eps_max >= 1 and sampling_eps_min >= 1:
+        t_block = torch.ones_like(eps_b)
+      else:
+        t_block = eps_b * (sampling_eps_max - sampling_eps_min) + sampling_eps_min
+
+      # [B, Nblocks] -> [B, n]
+      t = torch.repeat_interleave(t_block, lens, dim=1)
+      return t
 
   def _maybe_sub_sample(self, x0, attention_mask):
     seqlen = x0.shape[1]

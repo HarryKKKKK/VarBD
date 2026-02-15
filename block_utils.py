@@ -73,6 +73,16 @@ def make_multilevel_block_plan_for_repeated_sequence(
 # =========================
 # Block <-> token packing
 # =========================
+def token2block_from_plan(plan: BlockPlan, L: int) -> torch.LongTensor:
+    if int(plan.lens.sum().item()) != L:
+        raise ValueError(f"Plan sum {int(plan.lens.sum().item())} != L={L}")
+    t2b = torch.empty((L,), dtype=torch.long, device=plan.lens.device)
+    for bi in range(int(plan.lens.numel())):
+        s = int(plan.starts[bi].item())
+        l = int(plan.lens[bi].item())
+        t2b[s:s+l] = bi
+    return t2b
+
 def tokens_to_blocks(
     tokens: torch.LongTensor,   # [B, Ltot]
     plan: BlockPlan,

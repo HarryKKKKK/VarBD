@@ -21,6 +21,8 @@ try:
 except:
   FLEX_ATTN_AVAILABLE = False
 
+from block_utils import BlockPlan, make_fixed_plan, token2block_from_plan
+
 # Flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
@@ -76,6 +78,22 @@ def block_diff_mask(b, h, q_idx, kv_idx, block_size=None, n=None):
 @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
 def fused_flex_attention(q, k, v, mask=None):
     return flex_attention(q, k, v, block_mask=mask)
+
+# FIXME: block_diff_mask
+def block_diff_mask_variable(b, h, q_idx, kv_idx, *, token2block: torch.LongTensor, n: int):
+  x0_flag_q = (q_idx >= n)
+  x0_flag_kv = (kv_idx >= n)
+
+  tq = torch.where(x0_flag_q, q_idx - n, q_idx)   # [0, n)
+  tk = torch.where(x0_flag_kv, kv_idx - n, kv_idx)
+
+  block_q = token2block[tq]
+  block_kv = token2block[tk]
+
+  block_diagonal = (block_q == block_kv) & (x0_flag_q == x0_flag_kv)
+  offset_block_causal = ((block_q > block_kv) & (x0_flag_kv == 1) & (x0_flag_q == 0))
+  block_causal = ((block_q >= block_kv) & (x0_flag_kv == 1) & (x0_flag_q == 1))
+  return block_diagonal | offset_block_causal | block_causal
 
 
 def bias_dropout_add_scale(
@@ -694,8 +712,11 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       cond_dim=cond_dim,
       adaLN=self.adaLN,
       tie_word_embeddings=config.model.tie_word_embeddings)
+    
     if config.algo.cross_attn:
+      # FIXME: Variable mask gen will be done outside
       self.gen_mask(config.model.length, self.block_size, self.attn_backend)
+
 
   def _get_bias_dropout_scale(self):
     if self.training:
@@ -773,3 +794,27 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     if cross_attn and not sample_mode:
       x = x[:, :self.n]
     return x
+
+  # FIXME: mask generation
+  def gen_mask_from_plan(self, seqlen: int, plan: BlockPlan, attn_backend: str = 'sdpa'):
+    # plan.lens / plan.starts should sum to seqlen
+    device = next(self.parameters()).device
+    plan = BlockPlan(lens=plan.lens.to(device), starts=plan.starts.to(device))
+
+    token2block = token2block_from_plan(plan).to(device)  # [seqlen]
+    # self.token2block = token2block
+    # self.block_plan = plan
+
+    if attn_backend == 'flex' and FLEX_ATTN_AVAILABLE:
+      self.block_diff_mask = create_block_mask(
+        partial(block_diff_mask_variable, token2block=token2block, n=seqlen),
+        B=None, H=None, Q_LEN=seqlen * 2, KV_LEN=seqlen * 2
+      )
+    elif attn_backend == 'sdpa':
+      q = torch.arange(seqlen * 2, device=device)[:, None]
+      k = torch.arange(seqlen * 2, device=device)[None, :]
+      self.block_diff_mask = block_diff_mask_variable(
+        b=None, h=None, q_idx=q, kv_idx=k, token2block=token2block, n=seqlen
+      )
+    else:
+      raise ValueError(f'Unknown attention backend: {attn_backend}')

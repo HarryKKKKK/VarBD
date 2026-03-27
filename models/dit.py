@@ -21,7 +21,7 @@ try:
 except:
   FLEX_ATTN_AVAILABLE = False
 
-from block_utils import BlockPlan, make_fixed_plan, token2block_from_plan
+from block_utils import BlockPlan, token2block_from_plan
 
 # Flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
@@ -801,7 +801,7 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     device = next(self.parameters()).device
     plan = BlockPlan(lens=plan.lens.to(device), starts=plan.starts.to(device))
 
-    token2block = token2block_from_plan(plan).to(device)  # [seqlen]
+    token2block = token2block_from_plan(plan, L=seqlen).to(device)  # [seqlen]
     # self.token2block = token2block
     # self.block_plan = plan
 

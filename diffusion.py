@@ -18,7 +18,7 @@ import utils
 import numpy as np
 import itertools
 
-from block_utils import BlockPlan, token2block_from_plan, make_multilevel_block_plan_for_repeated_sequence
+from block_utils import BlockPlan, token2block_from_plan, make_plan_from_lens
 
 def _sample_categorical(categorical_probs):
   gumbel_norm = (1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log())
@@ -68,34 +68,30 @@ class Diffusion(L.LightningModule):
       self.block_size = self.config.model.length
 
     # FIXME: load block_sizes
-    self.block_sizes = None
-    self.K = None
-    self.L_single = None
-    self.block_plan = None
-    self.block_levels = None
-    self.token2block = None
+    self.block_sizes = None   # [32, 64, 128]
+    self.block_plan: BlockPlan | None = None
+    self.block_levels = None         
+    self.token2block = None  # [Ltot]
+    self.Bmax = None  # max block length
 
     if hasattr(config, "block_sizes") and config.block_sizes is not None:
-      bs = list(config.block_sizes)
+      bs = [int(x) for x in list(config.block_sizes)]
       if len(bs) > 0:
-        self.block_sizes = [int(x) for x in bs]
-        self.K = len(bs)
-        
-        # Ltot should be K * text_length
-        Ltot = int(self.config.model.length)
-        if Ltot % self.K != 0:
-          raise ValueError(f"model.length={Ltot} must be divisible by K={self.K} (len(block_sizes))")
-        self.L_single = Ltot // self.K
+        self.block_sizes = bs
+        self.Bmax = max(bs)
+        Ltot = int(sum(bs))
 
-        self.block_plan, self.block_levels = make_multilevel_block_plan_for_repeated_sequence(
-          L_single=self.L_single,
-          block_sizes=self.block_sizes,
-          device=torch.device("cpu"),
-        )
-        self.token2block = token2block_from_plan(self.block_plan)  # shape [Ltot]
+        if int(self.config.model.length) != Ltot:
+          raise ValueError(
+            f"Got model.length={int(self.config.model.length)} but sum(block_sizes)={Ltot}."
+          )
 
-        self.block_size = int(self.block_plan.lens.max().item())
-        print(f"[multilevel] block_sizes={self.block_sizes}, K={self.K}, L_single={self.L_single}, Ltot={Ltot}, Bmax={self.block_size}")
+        self.block_plan = make_plan_from_lens(bs, device=torch.device("cpu"))
+        self.token2block = token2block_from_plan(self.block_plan, L=Ltot)  # [Ltot]
+
+        self.block_size = self.Bmax
+
+        print(f"[multiscale] block_sizes={self.block_sizes}, Ltot={Ltot}, Bmax={self.Bmax}")
 
 
     if self.parameterization == 'ar':
@@ -329,7 +325,8 @@ class Diffusion(L.LightningModule):
           pin_memory=self.config.loader.pin_memory,
           sampler=dl_sampler,
           shuffle=False,
-          persistent_workers=True))
+          persistent_workers=True,
+          collate_fn=getattr(dl, "collate_fn", None),))
     self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
   def optimizer_step(self, *args, **kwargs):
@@ -499,7 +496,7 @@ class Diffusion(L.LightningModule):
         if len(self.metrics.valid_vars[noise_clip_start]) < 100:
           # only report variance over 100 batches
           nlls = losses_clip.nlls
-          # FIXME: reshape corresponding the block
+          # FIXME: reshape corresponding the block, need check
           if self.block_plan is not None:
             plan = self.block_plan
             lens = plan.lens.to(nlls.device)
@@ -515,8 +512,8 @@ class Diffusion(L.LightningModule):
               l = int(lens[bi].item())
               e = s + l
 
-              blk_nll = nlls[:, s:e]                         # [B, l]
-              blk_m = losses_clip.token_mask[:, s:e].to(nlls.dtype)
+              blk_nll = nlls[:, s:e]   # [B, l] - block token nll
+              blk_m = losses_clip.token_mask[:, s:e].to(nlls.dtype)  # [B, l] - mask 
               denom = blk_m.sum(dim=-1).clamp_min(eps)       # [B]
               mean_blk = (blk_nll * blk_m).sum(dim=-1) / denom  # [B]
               per_block.append(mean_blk)
@@ -615,7 +612,7 @@ class Diffusion(L.LightningModule):
         if regen.any():
           any_bad = True
 
-          p_blk = p[regen]              # [B_regen, 1]
+          p_blk = p[regen, s].unsqueeze(1)  # [B_regen, 1]
           new_move = (torch.rand((regen.sum().item(), l), device=x.device) <= p_blk)  # [B_regen, l]
           move_indices[regen, s:e] = new_move
           xt[regen, s:e] = torch.where(new_move, self.mask_index, x[regen, s:e])
@@ -892,7 +889,6 @@ class Diffusion(L.LightningModule):
 
   def _sample_t(
       self, batch_dims, device, sampling_eps_min, sampling_eps_max, block_size=None):
-    # FIXME: origional code
     if self.block_plan is None:
       if block_size is None:
         block_size = self.block_size

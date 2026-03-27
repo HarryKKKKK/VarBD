@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J train_owt_bd3lm_varblock
+#SBATCH -J train_owt_bd3lm_varblock_32_64_128
 #SBATCH -o watch_folder/%x_%j.out
 #SBATCH -e watch_folder/%x_%j.err
 #SBATCH -N 1
@@ -16,8 +16,8 @@ export HF_HOME=/vol/bitbucket/hk1122/.cache/huggingface
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 export TRANSFORMERS_CACHE=$HF_HOME/transformers
 
-BLOCK_SIZES="[64,32,16,8]"
-BLOCK_SIZE=16
+BLOCK_SIZES="[32,64,128]"
+BLOCK_SIZE=128
 
 PRETRAIN_CKPT=null
 # PRETRAIN_CKPT=kuleshov-group/bd3lm-owt-block_size1024-pretrain
@@ -34,12 +34,13 @@ python -u main.py \
     data.insert_train_special=False \
     data.insert_valid_special=False \
     data.insert_valid_eos=False \
-    model.length=1024 \
+    model.length=224 \
+    data.base_length=128 \
     block_size=${BLOCK_SIZE} \
     "block_sizes=${BLOCK_SIZES}" \
-    "wandb.name=bd3lm-owt-block_sizes${BLOCK_SIZES}" \
+    "wandb.name=bd3lm-owt-block_sizes_32_64_128" \
     mode=train \
-    model.attn_backend=flex \
+    model.attn_backend=sdpa \
     training.resample=True \
     training.from_pretrained=$PRETRAIN_CKPT \
     data.cache_dir=/vol/bitbucket/hk1122/.cache/bd3lm_datasets

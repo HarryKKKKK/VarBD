@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J train_owt_bd3lm_varblock
+#SBATCH -J train_owt_bd3lm_varblock_32_64_128
 #SBATCH -o watch_folder/%x_%j.out
 #SBATCH -e watch_folder/%x_%j.err
 #SBATCH -N 1
@@ -16,12 +16,11 @@ export HF_HOME=/vol/bitbucket/hk1122/.cache/huggingface
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 export TRANSFORMERS_CACHE=$HF_HOME/transformers
 
-# ===== Variable-length block params =====
-BLOCK_MAX=32
-NUM_BLOCKS=64
-PATTERN='[4,8,16,32]'
+BLOCK_SIZES="[32,64,128]"
+BLOCK_SIZE=128
 
 PRETRAIN_CKPT=null
+# PRETRAIN_CKPT=kuleshov-group/bd3lm-owt-block_size1024-pretrain
 
 python -u main.py \
     loader.global_batch_size=512 \
@@ -35,18 +34,13 @@ python -u main.py \
     data.insert_train_special=False \
     data.insert_valid_special=False \
     data.insert_valid_eos=False \
-    model.length=1024 \
-    block.enabled=true \
-    block.max_size=${BLOCK_MAX} \
-    block.num_blocks=${NUM_BLOCKS} \
-    block.min_size=4 \
-    block.scheme=fixed_cycle \
-    block.pattern=${PATTERN} \
-    wandb.name=bd3lm-owt-varblock_max${BLOCK_MAX}_N${NUM_BLOCKS} \
+    model.length=224 \
+    data.base_length=128 \
+    block_size=${BLOCK_SIZE} \
+    "block_sizes=${BLOCK_SIZES}" \
+    "wandb.name=bd3lm-owt-block_sizes_32_64_128" \
     mode=train \
-    model.attn_backend=flex \
+    model.attn_backend=sdpa \
     training.resample=True \
     training.from_pretrained=$PRETRAIN_CKPT \
-    data.cache_dir=/vol/bitbucket/hk1122/.cache/bd3lm_datasets \
-    checkpointing.resume_from_ckpt=true \
-    checkpointing.resume_ckpt_path=/vol/bitbucket/hk1122/bd3lms/outputs/openwebtext-train/2026.02.01/232145/checkpoints/last.ckpt
+    data.cache_dir=/vol/bitbucket/hk1122/.cache/bd3lm_datasets

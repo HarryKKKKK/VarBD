@@ -19,7 +19,78 @@ import transformers
 
 import utils
 
+from block_utils import BlockPlan, make_multiscale_compressed_sequence, make_plan_from_lens, tokens_to_blocks
+
 LOGGER = utils.get_logger(__name__)
+
+# FIXME: GPT code - no seed fixed
+def make_multiscale_collate_fn(
+    *,
+    block_sizes: list[int],
+    pad_id: int,
+    return_blocks: bool = True,
+):
+  plan_cpu = make_plan_from_lens(block_sizes, device=torch.device("cpu"))
+  Bmax = max(block_sizes)
+  Ltot = sum(block_sizes)
+
+  def _collate(batch: list[dict]):
+    input_ids = torch.stack([ex["input_ids"] for ex in batch], dim=0)      # [B, L]
+    attn_mask = torch.stack([ex["attention_mask"] for ex in batch], dim=0) # [B, L]
+
+    B, L = input_ids.shape
+    if any(s > L for s in block_sizes):
+      raise ValueError(f"block_sizes {block_sizes} must be <= original L={L}")
+
+    packed_list, packed_mask_list = [], []
+
+    info = torch.utils.data.get_worker_info()
+    seed = torch.initial_seed() if info is None else info.seed
+    g = torch.Generator(device=input_ids.device).manual_seed(seed)
+
+    for i in range(B):
+      blocks, masks = [], []
+      for s in block_sizes:
+        perm = torch.randperm(L, generator=g, device=input_ids.device)
+        idx = perm[:s]
+        idx, _ = torch.sort(idx)
+        blocks.append(input_ids[i][idx])
+        masks.append(attn_mask[i][idx])
+      packed_list.append(torch.cat(blocks, dim=0))
+      packed_mask_list.append(torch.cat(masks, dim=0))
+
+    packed = torch.stack(packed_list, dim=0)           # [B, Ltot]
+    packed_attn = torch.stack(packed_mask_list, dim=0) # [B, Ltot]
+    if packed.shape[1] != Ltot:
+      raise RuntimeError("packed length mismatch")
+
+    # device plan
+    plan = BlockPlan(lens=plan_cpu.lens.to(packed.device), starts=plan_cpu.starts.to(packed.device))
+
+    out = {
+      "input_ids": packed,
+      "attention_mask": packed_attn,
+      "block_plan_lens": plan.lens,       # [Nblocks]
+      "block_plan_starts": plan.starts,   # [Nblocks]
+      "levels": torch.arange(len(block_sizes), device=packed.device, dtype=torch.long),
+    }
+
+    if return_blocks:
+      blocks3d, block_lens2d, block_mask3d = tokens_to_blocks(
+        tokens=packed,
+        plan=plan,
+        Bmax=Bmax,
+        pad_id=pad_id,
+      )
+      out.update({
+        "blocks": blocks3d,
+        "blocks_mask": block_mask3d,
+        "blocks_lens": block_lens2d,
+      })
+
+    return out
+
+  return _collate
 
 
 def wt_detokenizer(string):
@@ -562,6 +633,20 @@ def get_tokenizer(config):
 
 def get_dataloaders(config, tokenizer, skip_train=False,
                     skip_valid=False, valid_seed=None):
+  # FIXME: indicator for using multiscale
+  multiscale = hasattr(config, "block_sizes") and config.block_sizes is not None and len(list(config.block_sizes)) > 0
+  # FIXME: change model.length
+  if multiscale:
+    base_length = int(getattr(config.data, "base_length", 0))
+    block_sizes = [int(x) for x in list(config.block_sizes)]
+    packed_length = sum(block_sizes)
+    if int(config.model.length) != packed_length:
+      raise ValueError(f"config.model.length={config.model.length} must equal sum(block_sizes)={packed_length}")
+  else:
+    base_length = int(config.model.length)
+    block_sizes = None
+
+
   num_gpus = torch.cuda.device_count()
   if config.trainer.accumulate_grad_batches > 1:
     assert (config.loader.global_batch_size
@@ -596,7 +681,7 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       insert_eos=True if not hasattr(config.data, 'insert_train_eos') else config.data.insert_train_eos,
       insert_special_tokens=True if not hasattr(config.data, 'insert_train_special') else config.data.insert_train_special,
       cache_dir=config.data.cache_dir,
-      block_size=config.model.length,
+      block_size=base_length,
       streaming=config.data.streaming,
       revision=config.data.get("train_revision", None))
   
@@ -615,20 +700,32 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       insert_special_tokens=True if not hasattr(config.data, 'insert_valid_special') else config.data.insert_valid_special,
       mode=validation_split,
       cache_dir=config.data.cache_dir,
-      block_size=config.model.length,
+      block_size=base_length,
       streaming=config.data.streaming,
       revision=config.data.get("valid_revision", None))
+
+  # FIXME: activate collate_fn for loaders
+  collate_fn = None
+  if multiscale:
+    collate_fn = make_multiscale_collate_fn(
+      block_sizes=block_sizes,
+      pad_id=tokenizer.pad_token_id,
+      return_blocks=True,
+    )
+
 
   if skip_train:
     train_loader = None
   else:
+    # FIXME: use collate_fn
     train_loader = torch.utils.data.DataLoader(
       train_set,
       batch_size=config.loader.batch_size,
       num_workers=config.loader.num_workers,
       pin_memory=config.loader.pin_memory,
       shuffle=not config.data.streaming,
-      persistent_workers=True)
+      persistent_workers=True,
+      collate_fn=collate_fn,)
     train_loader.tokenizer = tokenizer
   if skip_valid:
     valid_loader = None
@@ -639,13 +736,16 @@ def get_dataloaders(config, tokenizer, skip_train=False,
     else:
       shuffle_valid = True
       generator = torch.Generator().manual_seed(valid_seed)
+    
+    # FIXME: use collate_fn
     valid_loader = torch.utils.data.DataLoader(
       valid_set,
       batch_size=config.loader.eval_batch_size,
       num_workers=config.loader.num_workers,
       pin_memory=config.loader.pin_memory,
       shuffle=shuffle_valid,
-      generator=generator)
+      generator=generator,
+      collate_fn=collate_fn,)
     # Will be used in generative perplexity calculation
     valid_loader.tokenizer = tokenizer
 
@@ -756,3 +856,36 @@ class FaultTolerantDistributedSampler(torch.utils.data.DistributedSampler):
       yield index
 
     self.counter = 0
+
+if __name__ == "__main__":
+    print("=== Dataloader Test Start ===")
+
+    dummy_batch = [
+        {
+            "input_ids": torch.tensor([101, 11, 12, 13, 14, 15, 16, 102]),
+            "attention_mask": torch.ones(8, dtype=torch.long),
+        },
+        {
+            "input_ids": torch.tensor([101, 21, 22, 23, 24, 25, 26, 102]),
+            "attention_mask": torch.ones(8, dtype=torch.long),
+        },
+    ]
+
+    block_sizes = [4, 2]  
+    pad_id = 0
+
+    collate_fn = make_multiscale_collate_fn(
+        block_sizes=block_sizes,
+        pad_id=pad_id,
+        return_blocks=True,
+    )
+
+    output = collate_fn(dummy_batch)
+
+    print("\n=== Collate Output ===")
+    for k, v in output.items():
+        print(f"\nKey: {k}")
+        print("Shape:", tuple(v.shape) if isinstance(v, torch.Tensor) else "N/A")
+        print(v)
+
+    print("\n=== Test Finished ===")

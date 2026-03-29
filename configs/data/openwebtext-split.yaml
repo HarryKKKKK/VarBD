@@ -8,3 +8,4 @@ insert_train_eos: True
 insert_valid_eos: True
 insert_train_special: True
 insert_valid_special: True
+base_length: 128
